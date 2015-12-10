@@ -1,0 +1,134 @@
+#!/usr/bin/env perl
+
+# consul-lock - run a program under lock
+# Copyright (c) 2015 Robert Norris. MIT license.
+
+use 5.014;
+use warnings;
+use strict;
+
+use AnyEvent;
+use AnyEvent::Consul;
+use AnyEvent::Subprocess;
+use AnyEvent::Handle;
+
+my ($lockpath, @exec) = @ARGV;
+
+unless ($lockpath && @exec) {
+    say "usage: $0 <lock-path> <program> [args...]";
+    exit 1;
+}
+
+sub debug (@) {
+    state $debug = !!$ENV{CONSUL_LOCK_DEBUG};
+    return unless $debug;
+    say STDERR "CONSUL_LOCK: @_";
+}
+
+my $cv = AnyEvent->condvar;
+my $c = AnyEvent::Consul->new;
+
+my ($refresh_guard, $sleep_guard, $kill_guard, %signal_guard);
+
+sub begin_acquire {
+    my ($sid) = @_;
+
+    debug "acquiring lock";
+
+    $c->kv->put($lockpath, 1, wait => "10s", acquire => $sid, cb => sub {
+        my ($acquired) = @_;
+
+        unless ($acquired) {
+            $sleep_guard = AnyEvent->timer(after => "5s", cb => sub {
+                debug "couldn't acquire lock, sleeping";
+                undef $sleep_guard;
+                return begin_acquire($sid);
+            });
+            return;
+        }
+
+        debug "lock acquired";
+
+        my $job = AnyEvent::Subprocess->new(
+            delegates => ['StandardHandles'],
+            on_completion => sub {
+                my ($done) = @_;
+
+                debug "subprocess done, releasing lock";
+
+                undef $refresh_guard;
+                %signal_guard = ();
+
+                $c->kv->put($lockpath, 1, release => $sid, cb => sub {
+                    debug "destroying session";
+
+                    $c->session->destroy($sid, cb => sub {
+                        debug "all done, raising condvar";
+                        $cv->send($done->exit_value);
+                    });
+                });
+            },
+            code => sub {
+                debug "subprocess $$ started, executing: @exec";
+                exec @exec or debug "exec fail, aborting";
+                require POSIX;
+                POSIX::_exit(1);
+            },
+        );
+
+        my $run = $job->run;
+
+        $run->delegate('stdout')->handle->on_read(sub {
+            my ($handle) = @_;
+            print substr $handle->{rbuf}, 0, length($handle->{rbuf}), '';
+        });
+
+        $run->delegate('stderr')->handle->on_read(sub {
+            my ($handle) = @_;
+            print STDERR substr $handle->{rbuf}, 0, length($handle->{rbuf}), '';
+        });
+
+        my $stdin_handle; $stdin_handle = AnyEvent::Handle->new(
+            fh => \*STDIN,
+            on_read => sub {
+                $run->delegate('stdin')->handle->push_write(substr $stdin_handle->{rbuf}, 0, length($stdin_handle->{rbuf}), '');
+            },
+            on_eof => sub {
+                $run->delegate('stdin')->handle->close_fh;
+            },
+        );
+
+        for my $signal (qw(INT TERM HUP)) {
+            $signal_guard{$signal} = AnyEvent->signal(signal => $signal, cb => sub {
+                if ($kill_guard) {
+                    debug "caught SIG$signal during signal shutdown, ignoring";
+                    return;
+                }
+
+                debug "caught SIG$signal, passing to subprocess";
+
+                $run->kill($signal);
+                $kill_guard = AnyEvent->timer(after => "5s", cb => sub {
+                    debug "subprocess didn't die, sending SIGKILL";
+                    $run->kill;
+                });
+            });
+        }
+    });
+}
+
+$c->session->create(Consul::Session->new(name => $lockpath, ttl => "10s"), cb => sub {
+    my ($sid) = @_;
+    debug "created session, sid $sid";
+
+    $refresh_guard = AnyEvent->timer(after => "5s", interval => "5s", cb => sub {
+        debug "renewing session";
+        $c->session->renew($sid);
+    });
+
+    begin_acquire($sid);
+});
+
+my $rc = $cv->recv;
+debug "exiting with rc $rc";
+exit $rc;
