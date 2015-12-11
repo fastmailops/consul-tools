@@ -29,6 +29,7 @@ my $cv = AnyEvent->condvar;
 my $c = AnyEvent::Consul->new;
 
 my ($refresh_guard, $sleep_guard, $kill_guard, %signal_guard);
+my $run;
 
 sub begin_acquire {
     my ($sid) = @_;
@@ -47,73 +48,130 @@ sub begin_acquire {
             return;
         }
 
-        debug "lock acquired";
+        debug "lock acquired, confirming we really have it";
 
-        my $job = AnyEvent::Subprocess->new(
-            delegates => ['StandardHandles'],
-            on_completion => sub {
-                my ($done) = @_;
+        $c->kv->get($lockpath, cb => sub {
+            my ($kv, $meta) = @_;
 
-                debug "subprocess done, releasing lock";
+            if (!$kv || $sid ne ($kv->session // '')) {
+                debug "lost lock before exec, retrying";
+                return begin_acquire($sid);
+            }
 
-                undef $refresh_guard;
-                %signal_guard = ();
+            debug "we have the lock, setting up subprocess";
 
-                $c->kv->put($lockpath, 1, release => $sid, cb => sub {
-                    debug "destroying session";
+            my $job = AnyEvent::Subprocess->new(
+                delegates => ['StandardHandles'],
+                on_completion => sub {
+                    my ($done) = @_;
 
-                    $c->session->destroy($sid, cb => sub {
-                        debug "all done, raising condvar";
-                        $cv->send($done->exit_value);
+                    debug "subprocess done, releasing lock";
+
+                    undef $refresh_guard;
+                    %signal_guard = ();
+
+                    $c->kv->put($lockpath, 1, release => $sid, cb => sub {
+                        debug "destroying session";
+
+                        $c->session->destroy($sid, cb => sub {
+                            debug "all done, raising condvar";
+                            $cv->send($done->exit_value);
+                        });
                     });
-                });
-            },
-            code => sub {
-                debug "subprocess $$ started, executing: @exec";
-                exec @exec or debug "exec fail, aborting";
-                require POSIX;
-                POSIX::_exit(1);
-            },
-        );
+                },
+                code => sub {
+                    debug "subprocess $$ started, executing: @exec";
+                    exec @exec or debug "exec fail, aborting";
+                    require POSIX;
+                    POSIX::_exit(1);
+                },
+            );
 
-        my $run = $job->run;
+            $run = $job->run;
 
-        $run->delegate('stdout')->handle->on_read(sub {
-            my ($handle) = @_;
-            print substr $handle->{rbuf}, 0, length($handle->{rbuf}), '';
-        });
-
-        $run->delegate('stderr')->handle->on_read(sub {
-            my ($handle) = @_;
-            print STDERR substr $handle->{rbuf}, 0, length($handle->{rbuf}), '';
-        });
-
-        my $stdin_handle; $stdin_handle = AnyEvent::Handle->new(
-            fh => \*STDIN,
-            on_read => sub {
-                $run->delegate('stdin')->handle->push_write(substr $stdin_handle->{rbuf}, 0, length($stdin_handle->{rbuf}), '');
-            },
-            on_eof => sub {
-                $run->delegate('stdin')->handle->close_fh;
-            },
-        );
-
-        for my $signal (qw(INT TERM HUP)) {
-            $signal_guard{$signal} = AnyEvent->signal(signal => $signal, cb => sub {
-                if ($kill_guard) {
-                    debug "caught SIG$signal during signal shutdown, ignoring";
-                    return;
-                }
-
-                debug "caught SIG$signal, passing to subprocess";
-
-                $run->kill($signal);
-                $kill_guard = AnyEvent->timer(after => "5s", cb => sub {
-                    debug "subprocess didn't die, sending SIGKILL";
-                    $run->kill;
-                });
+            $run->delegate('stdout')->handle->on_read(sub {
+                my ($handle) = @_;
+                print substr $handle->{rbuf}, 0, length($handle->{rbuf}), '';
             });
-        }
+
+            $run->delegate('stderr')->handle->on_read(sub {
+                my ($handle) = @_;
+                print STDERR substr $handle->{rbuf}, 0, length($handle->{rbuf}), '';
+            });
+
+            my $stdin_handle; $stdin_handle = AnyEvent::Handle->new(
+                fh => \*STDIN,
+                on_read => sub {
+                    $run->delegate('stdin')->handle->push_write(substr $stdin_handle->{rbuf}, 0, length($stdin_handle->{rbuf}), '');
+                },
+                on_eof => sub {
+                    $run->delegate('stdin')->handle->close_fh;
+                },
+            );
+
+            for my $signal (qw(INT TERM HUP)) {
+                $signal_guard{$signal} = AnyEvent->signal(signal => $signal, cb => sub {
+                    if ($kill_guard) {
+                        debug "caught SIG$signal during subprocess shutdown, ignoring";
+                        return;
+                    }
+
+                    debug "caught SIG$signal";
+
+                    send_signal($signal);
+                });
+            }
+
+            begin_lockwatch($sid, $meta->index);
+        });
+    });
+}
+
+sub begin_lockwatch {
+    my ($sid, $index) = @_;
+
+    debug "setting up lock watcher, sid $sid, index $index";
+
+    $c->kv->get($lockpath, index => $index, wait => "30s",
+        cb => sub {
+            my ($kv, $meta) = @_;
+
+            if ($index == $meta->index) {
+                debug "lock key is unchanged";
+                return begin_lockwatch($sid, $index);
+            }
+
+            if ($kv && $sid eq ($kv->session // '')) {
+                debug "lock key changed, but our session still holds it";
+                return begin_lockwatch($sid, $meta->index);
+            }
+
+            debug "lost lock, terminating subprocess";
+
+            if ($kill_guard) {
+                debug "not terminating during signal shutdown";
+                return;
+            }
+
+            send_signal('TERM');
+        },
+        on_error => sub {
+            my ($msg) = @_;
+            debug "lock watcher error: $msg";
+            return begin_lockwatch($sid, $index);
+        },
+    );
+}
+
+sub send_signal {
+    my ($signal) = @_;
+
+    debug "sending SIG$signal to subprocess";
+
+    $run->kill($signal);
+    $kill_guard = AnyEvent->timer(after => "5s", cb => sub {
+        debug "subprocess didn't die, sending SIGKILL";
+        $run->kill;
     });
 }
 
