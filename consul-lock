@@ -31,12 +31,18 @@ my $c = AnyEvent::Consul->new;
 my ($refresh_guard, $sleep_guard, $kill_guard, %signal_guard);
 my $run;
 
+sub error_handler {
+    my ($msg) = @_;
+    say STDERR "consul-lock: error during API call, restarting: $msg";
+    start_session();
+}
+
 sub begin_acquire {
     my ($sid) = @_;
 
     debug "acquiring lock";
 
-    $c->kv->put($lockpath, 1, wait => "10s", acquire => $sid, cb => sub {
+    $c->kv->put($lockpath, 1, wait => "10s", acquire => $sid, on_error => \&error_handler, cb => sub {
         my ($acquired) = @_;
 
         unless ($acquired) {
@@ -50,7 +56,7 @@ sub begin_acquire {
 
         debug "lock acquired, confirming we really have it";
 
-        $c->kv->get($lockpath, cb => sub {
+        $c->kv->get($lockpath, on_error => \&error_handler, cb => sub {
             my ($kv, $meta) = @_;
 
             if (!$kv || $sid ne ($kv->session // '')) {
@@ -70,10 +76,10 @@ sub begin_acquire {
                     undef $refresh_guard;
                     %signal_guard = ();
 
-                    $c->kv->put($lockpath, 1, release => $sid, cb => sub {
+                    $c->kv->put($lockpath, 1, release => $sid, on_error => \&error_handler, cb => sub {
                         debug "destroying session";
 
-                        $c->session->destroy($sid, cb => sub {
+                        $c->session->destroy($sid, on_error => \&error_handler, cb => sub {
                             debug "all done, raising condvar";
                             $cv->send($done->exit_value);
                         });
@@ -110,7 +116,7 @@ sub begin_acquire {
             );
 
             for my $signal (qw(INT TERM HUP)) {
-                $signal_guard{$signal} = AnyEvent->signal(signal => $signal, cb => sub {
+                $signal_guard{$signal} = AnyEvent->signal(signal => $signal, on_error => \&error_handler, cb => sub {
                     if ($kill_guard) {
                         debug "caught SIG$signal during subprocess shutdown, ignoring";
                         return;
@@ -133,6 +139,7 @@ sub begin_lockwatch {
     debug "setting up lock watcher, sid $sid, index $index";
 
     $c->kv->get($lockpath, index => $index, wait => "30s",
+        on_error => \&error_handler,
         cb => sub {
             my ($kv, $meta) = @_;
 
@@ -175,17 +182,23 @@ sub send_signal {
     });
 }
 
-$c->session->create(Consul::Session->new(name => $lockpath, ttl => "10s"), cb => sub {
-    my ($sid) = @_;
-    debug "created session, sid $sid";
+sub start_session {
+    undef $refresh_guard;
 
-    $refresh_guard = AnyEvent->timer(after => "5s", interval => "5s", cb => sub {
-        debug "renewing session";
-        $c->session->renew($sid);
+    $c->session->create(Consul::Session->new(name => $lockpath, ttl => "10s"), on_error => \&error_handler, cb => sub {
+        my ($sid) = @_;
+        debug "created session, sid $sid";
+
+        $refresh_guard = AnyEvent->timer(after => "5s", interval => "5s", cb => sub {
+            debug "renewing session";
+            $c->session->renew($sid, on_error => \&error_handler);
+        });
+
+        begin_acquire($sid);
     });
+}
 
-    begin_acquire($sid);
-});
+start_session();
 
 my $rc = $cv->recv;
 debug "exiting with rc $rc";
