@@ -8,7 +8,7 @@ use warnings;
 use strict;
 
 use AnyEvent;
-use AnyEvent::Consul;
+use AnyEvent::Consul 0.005;
 use AnyEvent::Log;
 use Sys::Syslog qw(openlog);
 use Date::Format qw(time2str);
@@ -50,7 +50,7 @@ my $kvapi = AnyEvent::Consul->kv(timeout => 60);
 
 for my $prefix (@prefixes) {
     $log->("@$prefix: starting watcher");
-    $kvapi->get_all(@$prefix, cb => sub { change_handler($prefix, 0, @_) }, on_error => sub { error_handler($prefix, @_) });
+    $kvapi->get_all(@$prefix, cb => sub { change_handler($prefix, 0, @_) }, error_cb => sub { error_handler($prefix, @_) });
 }
 
 $cv->recv;
@@ -58,8 +58,11 @@ $cv->recv;
 sub error_handler {
     my ($prefix, $msg) = @_;
     $log->("E: @$prefix: $msg");
-    $log->("@$prefix: restarting watcher");
-    $kvapi->get_all(@$prefix, cb => sub { change_handler($prefix, 0, @_) }, on_error => sub { error_handler($prefix, @_) });
+    my $sleep_guard; $sleep_guard = AnyEvent->timer(after => "1s", cb => sub {
+        $log->("@$prefix: restarting watcher");
+        $kvapi->get_all(@$prefix, cb => sub { change_handler($prefix, 0, @_) }, error_cb => sub { error_handler($prefix, @_) });
+        undef $sleep_guard;
+    });
 }
 
 sub change_handler {
@@ -78,7 +81,7 @@ sub change_handler {
         }
     }
 
-    $kvapi->get_all(@$prefix, index => $index, wait => "30s", cb => sub { change_handler($prefix, $index, @_) }, on_error => sub { error_handler($prefix, @_) });
+    $kvapi->get_all(@$prefix, index => $index, wait => "30s", cb => sub { change_handler($prefix, $index, @_) }, error_cb => sub { error_handler($prefix, @_) });
 }
 
 1;
