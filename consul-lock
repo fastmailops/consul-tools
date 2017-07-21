@@ -15,14 +15,14 @@ use AnyEvent::Handle;
 my ($lockpath, @exec) = @ARGV;
 
 unless ($lockpath && @exec) {
-    say "usage: $0 <lock-path> <program> [args...]";
-    exit 1;
+  say "usage: $0 <lock-path> <program> [args...]";
+  exit 1;
 }
 
 sub debug (@) {
-    state $debug = !!$ENV{CONSUL_LOCK_DEBUG};
-    return unless $debug;
-    say STDERR "CONSUL_LOCK: @_";
+  state $debug = !!$ENV{CONSUL_LOCK_DEBUG};
+  return unless $debug;
+  say STDERR "CONSUL_LOCK: @_";
 }
 
 my $cv = AnyEvent->condvar;
@@ -32,170 +32,170 @@ my ($refresh_guard, $sleep_guard, $kill_guard, %signal_guard);
 my $run;
 
 sub error_handler {
-    my ($msg) = @_;
-    say STDERR "consul-lock: error during API call, restarting: $msg";
-    start_session();
+  my ($msg) = @_;
+  say STDERR "consul-lock: error during API call, restarting: $msg";
+  start_session();
 }
 
 sub begin_acquire {
-    my ($sid) = @_;
+  my ($sid) = @_;
 
-    debug "acquiring lock";
+  debug "acquiring lock";
 
-    $c->kv->put($lockpath, 1, wait => "10s", acquire => $sid, error_cb => \&error_handler, cb => sub {
-        my ($acquired) = @_;
+  $c->kv->put($lockpath, 1, wait => "10s", acquire => $sid, error_cb => \&error_handler, cb => sub {
+    my ($acquired) = @_;
 
-        unless ($acquired) {
-            $sleep_guard = AnyEvent->timer(after => "5s", cb => sub {
-                debug "couldn't acquire lock, sleeping";
-                undef $sleep_guard;
-                return begin_acquire($sid);
+    unless ($acquired) {
+      $sleep_guard = AnyEvent->timer(after => "5s", cb => sub {
+        debug "couldn't acquire lock, sleeping";
+        undef $sleep_guard;
+        return begin_acquire($sid);
+      });
+      return;
+    }
+
+    debug "lock acquired, confirming we really have it";
+
+    $c->kv->get($lockpath, error_cb => \&error_handler, cb => sub {
+      my ($kv, $meta) = @_;
+
+      if (!$kv || $sid ne ($kv->session // '')) {
+        debug "lost lock before exec, retrying";
+        return begin_acquire($sid);
+      }
+
+      debug "we have the lock, setting up subprocess";
+
+      my $job = AnyEvent::Subprocess->new(
+        delegates => ['StandardHandles'],
+        on_completion => sub {
+          my ($done) = @_;
+
+          debug "subprocess done, releasing lock";
+
+          undef $refresh_guard;
+          %signal_guard = ();
+
+          $c->kv->put($lockpath, 1, release => $sid, error_cb => \&error_handler, cb => sub {
+            debug "destroying session";
+
+            $c->session->destroy($sid, error_cb => \&error_handler, cb => sub {
+              debug "all done, raising condvar";
+              $cv->send($done->exit_value);
             });
+          });
+        },
+        code => sub {
+          debug "subprocess $$ started, executing: @exec";
+          exec @exec or debug "exec fail, aborting";
+          require POSIX;
+          POSIX::_exit(1);
+        },
+      );
+
+      $run = $job->run;
+
+      $run->delegate('stdout')->handle->on_read(sub {
+        my ($handle) = @_;
+        print substr $handle->{rbuf}, 0, length($handle->{rbuf}), '';
+      });
+
+      $run->delegate('stderr')->handle->on_read(sub {
+        my ($handle) = @_;
+        print STDERR substr $handle->{rbuf}, 0, length($handle->{rbuf}), '';
+      });
+
+      my $stdin_handle; $stdin_handle = AnyEvent::Handle->new(
+        fh => \*STDIN,
+        on_read => sub {
+          $run->delegate('stdin')->handle->push_write(substr $stdin_handle->{rbuf}, 0, length($stdin_handle->{rbuf}), '');
+        },
+        on_eof => sub {
+          $run->delegate('stdin')->handle->close_fh;
+        },
+      );
+
+      for my $signal (qw(INT TERM HUP)) {
+        $signal_guard{$signal} = AnyEvent->signal(signal => $signal, error_cb => \&error_handler, cb => sub {
+          if ($kill_guard) {
+            debug "caught SIG$signal during subprocess shutdown, ignoring";
             return;
-        }
+          }
 
-        debug "lock acquired, confirming we really have it";
+          debug "caught SIG$signal";
 
-        $c->kv->get($lockpath, error_cb => \&error_handler, cb => sub {
-            my ($kv, $meta) = @_;
-
-            if (!$kv || $sid ne ($kv->session // '')) {
-                debug "lost lock before exec, retrying";
-                return begin_acquire($sid);
-            }
-
-            debug "we have the lock, setting up subprocess";
-
-            my $job = AnyEvent::Subprocess->new(
-                delegates => ['StandardHandles'],
-                on_completion => sub {
-                    my ($done) = @_;
-
-                    debug "subprocess done, releasing lock";
-
-                    undef $refresh_guard;
-                    %signal_guard = ();
-
-                    $c->kv->put($lockpath, 1, release => $sid, error_cb => \&error_handler, cb => sub {
-                        debug "destroying session";
-
-                        $c->session->destroy($sid, error_cb => \&error_handler, cb => sub {
-                            debug "all done, raising condvar";
-                            $cv->send($done->exit_value);
-                        });
-                    });
-                },
-                code => sub {
-                    debug "subprocess $$ started, executing: @exec";
-                    exec @exec or debug "exec fail, aborting";
-                    require POSIX;
-                    POSIX::_exit(1);
-                },
-            );
-
-            $run = $job->run;
-
-            $run->delegate('stdout')->handle->on_read(sub {
-                my ($handle) = @_;
-                print substr $handle->{rbuf}, 0, length($handle->{rbuf}), '';
-            });
-
-            $run->delegate('stderr')->handle->on_read(sub {
-                my ($handle) = @_;
-                print STDERR substr $handle->{rbuf}, 0, length($handle->{rbuf}), '';
-            });
-
-            my $stdin_handle; $stdin_handle = AnyEvent::Handle->new(
-                fh => \*STDIN,
-                on_read => sub {
-                    $run->delegate('stdin')->handle->push_write(substr $stdin_handle->{rbuf}, 0, length($stdin_handle->{rbuf}), '');
-                },
-                on_eof => sub {
-                    $run->delegate('stdin')->handle->close_fh;
-                },
-            );
-
-            for my $signal (qw(INT TERM HUP)) {
-                $signal_guard{$signal} = AnyEvent->signal(signal => $signal, error_cb => \&error_handler, cb => sub {
-                    if ($kill_guard) {
-                        debug "caught SIG$signal during subprocess shutdown, ignoring";
-                        return;
-                    }
-
-                    debug "caught SIG$signal";
-
-                    send_signal($signal);
-                });
-            }
-
-            begin_lockwatch($sid, $meta->index);
+          send_signal($signal);
         });
+      }
+
+      begin_lockwatch($sid, $meta->index);
     });
+  });
 }
 
 sub begin_lockwatch {
-    my ($sid, $index) = @_;
+  my ($sid, $index) = @_;
 
-    debug "setting up lock watcher, sid $sid, index $index";
+  debug "setting up lock watcher, sid $sid, index $index";
 
-    $c->kv->get($lockpath, index => $index, wait => "30s",
-        error_cb => \&error_handler,
-        cb => sub {
-            my ($kv, $meta) = @_;
+  $c->kv->get($lockpath, index => $index, wait => "30s",
+    error_cb => \&error_handler,
+    cb => sub {
+      my ($kv, $meta) = @_;
 
-            if ($index == $meta->index) {
-                debug "lock key is unchanged";
-                return begin_lockwatch($sid, $index);
-            }
+      if ($index == $meta->index) {
+        debug "lock key is unchanged";
+        return begin_lockwatch($sid, $index);
+      }
 
-            if ($kv && $sid eq ($kv->session // '')) {
-                debug "lock key changed, but our session still holds it";
-                return begin_lockwatch($sid, $meta->index);
-            }
+      if ($kv && $sid eq ($kv->session // '')) {
+        debug "lock key changed, but our session still holds it";
+        return begin_lockwatch($sid, $meta->index);
+      }
 
-            debug "lost lock, terminating subprocess";
+      debug "lost lock, terminating subprocess";
 
-            if ($kill_guard) {
-                debug "not terminating during signal shutdown";
-                return;
-            }
+      if ($kill_guard) {
+        debug "not terminating during signal shutdown";
+        return;
+      }
 
-            send_signal('TERM');
-        },
-        error_cb => sub {
-            my ($msg) = @_;
-            debug "lock watcher error: $msg";
-            return begin_lockwatch($sid, $index);
-        },
-    );
+      send_signal('TERM');
+    },
+    error_cb => sub {
+      my ($msg) = @_;
+      debug "lock watcher error: $msg";
+      return begin_lockwatch($sid, $index);
+    },
+  );
 }
 
 sub send_signal {
-    my ($signal) = @_;
+  my ($signal) = @_;
 
-    debug "sending SIG$signal to subprocess";
+  debug "sending SIG$signal to subprocess";
 
-    $run->kill($signal);
-    $kill_guard = AnyEvent->timer(after => "5s", cb => sub {
-        debug "subprocess didn't die, sending SIGKILL";
-        $run->kill;
-    });
+  $run->kill($signal);
+  $kill_guard = AnyEvent->timer(after => "5s", cb => sub {
+    debug "subprocess didn't die, sending SIGKILL";
+    $run->kill;
+  });
 }
 
 sub start_session {
-    undef $refresh_guard;
+  undef $refresh_guard;
 
-    $c->session->create(Consul::Session->new(name => $lockpath, ttl => "10s"), error_cb => \&error_handler, cb => sub {
-        my ($sid) = @_;
-        debug "created session, sid $sid";
+  $c->session->create(Consul::Session->new(name => $lockpath, ttl => "10s"), error_cb => \&error_handler, cb => sub {
+    my ($sid) = @_;
+    debug "created session, sid $sid";
 
-        $refresh_guard = AnyEvent->timer(after => "5s", interval => "5s", cb => sub {
-            debug "renewing session";
-            $c->session->renew($sid, error_cb => \&error_handler);
-        });
-
-        begin_acquire($sid);
+    $refresh_guard = AnyEvent->timer(after => "5s", interval => "5s", cb => sub {
+      debug "renewing session";
+      $c->session->renew($sid, error_cb => \&error_handler);
     });
+
+    begin_acquire($sid);
+  });
 }
 
 start_session();

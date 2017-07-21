@@ -16,72 +16,72 @@ use Date::Format qw(time2str);
 my $at_terminal = -t \*STDIN;
 
 if (!$at_terminal || $ENV{CONSUL_KVSYNC_SYSLOG}) {
-    openlog("consul-kvsync", "ndelay,pid", "local1");
-    AnyEvent::Log::ctx->log_to_syslog("local1");
-    AnyEvent::Log::ctx->fmt_cb(sub {
-        my $str = $_[3];
-        $str =~ s/\n(?=.)/\n+ /g;
-        [$_[2], $str];
-    });
+  openlog("consul-kvsync", "ndelay,pid", "local1");
+  AnyEvent::Log::ctx->log_to_syslog("local1");
+  AnyEvent::Log::ctx->fmt_cb(sub {
+    my $str = $_[3];
+    $str =~ s/\n(?=.)/\n+ /g;
+    [$_[2], $str];
+  });
 }
 else  {
-    AnyEvent::Log::ctx->log_to_warn;
-    AnyEvent::Log::ctx->fmt_cb(sub {
-        sprintf "%s %s\n", time2str("%Y-%m-%dT%H:%M:%S", time), $_[3];
-    });
+  AnyEvent::Log::ctx->log_to_warn;
+  AnyEvent::Log::ctx->fmt_cb(sub {
+    sprintf "%s %s\n", time2str("%Y-%m-%dT%H:%M:%S", time), $_[3];
+  });
 }
 my $log = AnyEvent::Log::logger("notice");
 
 my @prefixes = map { m/^([\w\/]+)(?:\@(\w+))?$/; [$1, $2 ? (dc => $2) : ()] } @ARGV;
 
 unless (@prefixes) {
-    if ($at_terminal) {
-        say "usage: $0 [kv-path\@dc...]";
-    }
-    else {
-        $log->("no prefixes configured, sleeping");
-        while (1) { sleep 3600 }
-    }
-    exit 1;
+  if ($at_terminal) {
+    say "usage: $0 [kv-path\@dc...]";
+  }
+  else {
+    $log->("no prefixes configured, sleeping");
+    while (1) { sleep 3600 }
+  }
+  exit 1;
 }
 
 my $cv = AnyEvent->condvar;
 my $kvapi = AnyEvent::Consul->kv(timeout => 60);
 
 for my $prefix (@prefixes) {
-    $log->("@$prefix: starting watcher");
-    $kvapi->get_all(@$prefix, cb => sub { change_handler($prefix, 0, @_) }, error_cb => sub { error_handler($prefix, @_) });
+  $log->("@$prefix: starting watcher");
+  $kvapi->get_all(@$prefix, cb => sub { change_handler($prefix, 0, @_) }, error_cb => sub { error_handler($prefix, @_) });
 }
 
 $cv->recv;
 
 sub error_handler {
-    my ($prefix, $msg) = @_;
-    $log->("E: @$prefix: $msg");
-    my $sleep_guard; $sleep_guard = AnyEvent->timer(after => "1s", cb => sub {
-        $log->("@$prefix: restarting watcher");
-        $kvapi->get_all(@$prefix, cb => sub { change_handler($prefix, 0, @_) }, error_cb => sub { error_handler($prefix, @_) });
-        undef $sleep_guard;
-    });
+  my ($prefix, $msg) = @_;
+  $log->("E: @$prefix: $msg");
+  my $sleep_guard; $sleep_guard = AnyEvent->timer(after => "1s", cb => sub {
+    $log->("@$prefix: restarting watcher");
+    $kvapi->get_all(@$prefix, cb => sub { change_handler($prefix, 0, @_) }, error_cb => sub { error_handler($prefix, @_) });
+    undef $sleep_guard;
+  });
 }
 
 sub change_handler {
-    my ($prefix, $prev_index, $kv, $meta) = @_;
+  my ($prefix, $prev_index, $kv, $meta) = @_;
 
-    my $index = $meta->index;
+  my $index = $meta->index;
 
-    if ($index > $prev_index) {
-        my @changed = grep { $_->modify_index > $prev_index } @$kv;
-        $log->("@$prefix: $prev_index -> $index, ".scalar(@changed)." keys changed");
-        for my $change (@changed) {
-            $kvapi->put($change->key, $change->value, cb => sub {
-                my ($success, $meta) = @_;
-                $log->("@$prefix: updated ".$change->key." to ".$change->value.", ".($success ? "succeeded" : "FAILED"));
-            });
-        }
+  if ($index > $prev_index) {
+    my @changed = grep { $_->modify_index > $prev_index } @$kv;
+    $log->("@$prefix: $prev_index -> $index, ".scalar(@changed)." keys changed");
+    for my $change (@changed) {
+      $kvapi->put($change->key, $change->value, cb => sub {
+        my ($success, $meta) = @_;
+        $log->("@$prefix: updated ".$change->key." to ".$change->value.", ".($success ? "succeeded" : "FAILED"));
+      });
     }
+  }
 
-    $kvapi->get_all(@$prefix, index => $index, wait => "30s", cb => sub { change_handler($prefix, $index, @_) }, error_cb => sub { error_handler($prefix, @_) });
+  $kvapi->get_all(@$prefix, index => $index, wait => "30s", cb => sub { change_handler($prefix, $index, @_) }, error_cb => sub { error_handler($prefix, @_) });
 }
 
 1;
