@@ -32,14 +32,30 @@ else  {
 }
 my $log = AnyEvent::Log::logger("notice");
 
-my @prefixes = map { m/^([\w\/]+)(?:\@(\w+))?$/; [$1, $2 ? (dc => $2) : ()] } @ARGV;
+# args are shaped like: [kv-path@remote-dc]
+# changes under the path on the remote are copied to the local (unnamed) dc on
+# the same path
 
-unless (@prefixes) {
+# path => source dc
+my %dc_for_path;
+for my $pathspec (@ARGV) {
+  my ($path, $dc) = split '@', $pathspec;
+  unless (defined $path && defined $dc) {
+    die "E: invalid path: $pathspec\n";
+  }
+  if (exists $dc_for_path{$path}) {
+    die "E: already declared path: $pathspec\n";
+  }
+  $dc_for_path{$path} = $dc;
+}
+my @paths = sort keys %dc_for_path;
+
+unless (@paths) {
   if ($at_terminal) {
     say "usage: $0 [kv-path\@dc...]";
   }
   else {
-    $log->("no prefixes configured, sleeping");
+    $log->("no paths configured, sleeping");
     while (1) { sleep 3600 }
   }
   exit 1;
@@ -48,40 +64,76 @@ unless (@prefixes) {
 my $cv = AnyEvent->condvar;
 my $kvapi = AnyEvent::Consul->kv(timeout => 60);
 
-for my $prefix (@prefixes) {
-  $log->("@$prefix: starting watcher");
-  $kvapi->get_all(@$prefix, cb => sub { change_handler($prefix, 0, @_) }, error_cb => sub { error_handler($prefix, @_) });
+for my $path (@paths) {
+  my $dc = $dc_for_path{$path};
+  $log->("$path\@$dc: starting watcher");
+  setup_watcher($path, $dc, 0);
 }
 
 $cv->recv;
 
+sub setup_watcher {
+  my ($path, $dc, $index) = @_;
+
+  # if a specific index is provided, then we should block until we move past
+  # that index. index 0 is to get the initial state, and should just return
+  my @extra;
+  if ($index > 0) {
+    @extra = (
+      index => $index,
+      wait => '30s',
+    );
+  }
+
+  $kvapi->get_all(
+    $path,
+    dc => $dc,
+    @extra,
+    cb => sub { source_change_handler($path, $dc, $index, @_) },
+    error_cb => sub { source_error_handler($path, $dc, @_) }
+  );
+}
+
 sub error_handler {
-  my ($prefix, $msg) = @_;
-  $log->("E: @$prefix: $msg");
+  my ($path, $dc, $msg) = @_;
+
+  $log->("E: $path\@$dc: $msg");
+
   my $sleep_guard; $sleep_guard = AnyEvent->timer(after => "1s", cb => sub {
-    $log->("@$prefix: restarting watcher");
-    $kvapi->get_all(@$prefix, cb => sub { change_handler($prefix, 0, @_) }, error_cb => sub { error_handler($prefix, @_) });
+    $log->("$path\@$dc: restarting watcher");
+    setup_watcher($path, $dc, 0);
     undef $sleep_guard;
   });
 }
 
 sub change_handler {
-  my ($prefix, $prev_index, $kv, $meta) = @_;
+  my ($path, $dc, $prev_index, $kv, $meta) = @_;
 
   my $index = $meta->index;
 
   if ($index > $prev_index) {
     my @changed = grep { $_->modify_index > $prev_index } @$kv;
-    $log->("@$prefix: $prev_index -> $index, ".scalar(@changed)." keys changed");
+
+    $log->(
+      "$path\@$dc: $prev_index -> $index, "
+      .scalar(@changed)." keys changed"
+    );
+
     for my $change (@changed) {
-      $kvapi->put($change->key, $change->value, cb => sub {
-        my ($success, $meta) = @_;
-        $log->("@$prefix: updated ".$change->key." to ".$change->value.", ".($success ? "succeeded" : "FAILED"));
+      $kvapi->put(
+        $change->key,
+        $change->value,
+        cb => sub {
+          my ($success, $meta) = @_;
+          $log->(
+            "$path\@$dc: updated ".$change->key." to ".$change->value.", "
+            .($success ? "succeeded" : "FAILED")
+          );
       });
     }
   }
 
-  $kvapi->get_all(@$prefix, index => $index, wait => "30s", cb => sub { change_handler($prefix, $index, @_) }, error_cb => sub { error_handler($prefix, @_) });
+  setup_watcher($path, $dc, $index);
 }
 
 1;
