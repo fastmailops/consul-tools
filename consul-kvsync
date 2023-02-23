@@ -61,18 +61,82 @@ unless (@paths) {
   exit 1;
 }
 
+# keys present on the destination last time we looked
+#
+# path => {
+#   path/a => 1
+#   path/b => 1
+#   ...
+my %dest_keys;
+
+
 my $cv = AnyEvent->condvar;
 my $kvapi = AnyEvent::Consul->kv(timeout => 60);
 
 for my $path (@paths) {
+  $log->("path: starting dest watcher");
+  setup_dest_watcher($path, 0);
+
   my $dc = $dc_for_path{$path};
-  $log->("$path\@$dc: starting watcher");
-  setup_watcher($path, $dc, 0);
+  $log->("$path\@$dc: starting source watcher");
+  setup_source_watcher($path, $dc, 0);
 }
 
 $cv->recv;
 
-sub setup_watcher {
+
+sub setup_dest_watcher {
+  my ($path, $index) = @_;
+
+  # if a specific index is provided, then we should block until we move past
+  # that index. index 0 is to get the initial state, and should just return
+  my @extra;
+  if ($index > 0) {
+    @extra = (
+      index => $index,
+      wait => '30s',
+    );
+  }
+
+  $kvapi->get_all(
+    $path,
+    @extra,
+    cb => sub { dest_change_handler($path, $index, @_) },
+    error_cb => sub { dest_error_handler($path, @_) },
+  );
+}
+
+sub dest_error_handler {
+  my ($path,  $msg) = @_;
+
+  $log->("E: $path: $msg");
+
+  my $sleep_guard; $sleep_guard = AnyEvent->timer(after => "1s", cb => sub {
+    $log->("$path: restarting dest watcher");
+    setup_dest_watcher($path, 0);
+    undef $sleep_guard;
+  });
+}
+
+sub dest_change_handler {
+  my ($path, $prev_index, $kv, $meta) = @_;
+
+  my $index = $meta->index;
+
+  if ($index > $prev_index) {
+    $dest_keys{$path} = { map { $_->key => 1 } @$kv };
+
+    $log->(
+      "$path: $prev_index -> $index, "
+      .scalar(@$kv)." keys exist"
+    );
+  }
+
+  setup_dest_watcher($path, $index);
+}
+
+
+sub setup_source_watcher {
   my ($path, $dc, $index) = @_;
 
   # if a specific index is provided, then we should block until we move past
@@ -94,46 +158,76 @@ sub setup_watcher {
   );
 }
 
-sub error_handler {
+sub source_error_handler {
   my ($path, $dc, $msg) = @_;
 
   $log->("E: $path\@$dc: $msg");
 
   my $sleep_guard; $sleep_guard = AnyEvent->timer(after => "1s", cb => sub {
-    $log->("$path\@$dc: restarting watcher");
-    setup_watcher($path, $dc, 0);
+    $log->("$path\@$dc: restarting source watcher");
+    setup_source_watcher($path, $dc, 0);
     undef $sleep_guard;
   });
 }
 
-sub change_handler {
+sub source_change_handler {
   my ($path, $dc, $prev_index, $kv, $meta) = @_;
 
   my $index = $meta->index;
 
   if ($index > $prev_index) {
+    my ($created, $updated, $deleted) = (0,0,0);
+    my %source_keys = map { $_->key => 1 } @$kv;
+
+    for my $key (keys %{$dest_keys{$path}}) {
+      next if $source_keys{$key};
+
+      $kvapi->delete(
+        $key,
+        cb => sub {
+          my ($success, $meta) = @_;
+          $log->("$path: deleted $key, ".($success ? "succeeded" : "FAILED"));
+        },
+      );
+
+      $deleted++;
+    }
+
     my @changed = grep { $_->modify_index > $prev_index } @$kv;
 
-    $log->(
-      "$path\@$dc: $prev_index -> $index, "
-      .scalar(@changed)." keys changed"
-    );
-
     for my $change (@changed) {
+      my $key = $change->key;
+      my $is_create = !exists $dest_keys{$path}{$key};
+
       $kvapi->put(
-        $change->key,
+        $key,
         $change->value,
         cb => sub {
           my ($success, $meta) = @_;
           $log->(
-            "$path\@$dc: updated ".$change->key." to ".$change->value.", "
+            "$path\@$dc: ".($is_create ? "created" : "updated")
+            ." $key = ".$change->value.", "
             .($success ? "succeeded" : "FAILED")
           );
-      });
+        },
+      );
+
+      if ($is_create) {
+        $created++;
+      }
+      else {
+        $updated++;
+      }
     }
+
+    $log->(
+      "$path\@$dc: $prev_index -> $index, "
+      ."$created created, $updated updated, $deleted deleted"
+    );
+
   }
 
-  setup_watcher($path, $dc, $index);
+  setup_source_watcher($path, $dc, $index);
 }
 
 1;
