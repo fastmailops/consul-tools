@@ -126,10 +126,7 @@ sub dest_change_handler {
   if ($index > $prev_index) {
     $dest_keys{$path} = { map { $_->key => 1 } @$kv };
 
-    $log->(
-      "$path: $prev_index -> $index, "
-      .scalar(@$kv)." keys exist"
-    );
+    $log->("$path: $prev_index -> $index, %d keys exist", scalar @$kv);
   }
 
   setup_dest_watcher($path, $index);
@@ -186,7 +183,8 @@ sub source_change_handler {
         $key,
         cb => sub {
           my ($success, $meta) = @_;
-          $log->("$path: deleted $key, ".($success ? "succeeded" : "FAILED"));
+          $log->("$path: deleted $key, %s",
+            ($success ? "succeeded" : "FAILED"));
         },
       );
 
@@ -205,9 +203,10 @@ sub source_change_handler {
         cb => sub {
           my ($success, $meta) = @_;
           $log->(
-            "$path\@$dc: ".($is_create ? "created" : "updated")
-            ." $key = ".$change->value.", "
-            .($success ? "succeeded" : "FAILED")
+            "$path\@$dc: %s $key = %s, %s",
+            ($is_create ? "created" : "updated"),
+            $change->value,
+            ($success ? "succeeded" : "FAILED"),
           );
         },
       );
@@ -221,8 +220,12 @@ sub source_change_handler {
     }
 
     $log->(
-      "$path\@$dc: $prev_index -> $index, "
-      ."$created created, $updated updated, $deleted deleted"
+      "$path\@$dc: %d -> %d, %d created, %d updated, %d deleted",
+      $prev_index,
+      $index,
+      $created,
+      $updated,
+      $deleted,
     );
 
   }
